@@ -75,3 +75,42 @@ func TestGetEBSMonthlyCost(t *testing.T) {
 		}
 	}
 }
+
+func TestGetRDSMonthlyCost(t *testing.T) {
+	tests := []struct {
+		dbClass string
+		want    float64
+	}{
+		{"db.t3.micro", 12.41},
+		{"db.m5.large", 138.70},
+		{"custom.2xlarge", 400.00},
+		{"custom.micro", 12.50},
+		{"unknown.class", DefaultFallbackRDS},
+	}
+
+	for _, tt := range tests {
+		got := GetRDSMonthlyCost(tt.dbClass)
+		if got != tt.want {
+			t.Errorf("GetRDSMonthlyCost(%q) = %v, want %v", tt.dbClass, got, tt.want)
+		}
+	}
+}
+
+func TestGetCloudSQLMonthlyCost(t *testing.T) {
+	tests := []struct {
+		tier string
+		want float64
+	}{
+		{"db-f1-micro", 7.67},
+		{"db-n1-standard-1", 50.37},
+		{"custom-micro", 7.67},
+		{"unknown-tier", DefaultFallbackCloudSQL},
+	}
+
+	for _, tt := range tests {
+		got := GetCloudSQLMonthlyCost(tt.tier)
+		if got != tt.want {
+			t.Errorf("GetCloudSQLMonthlyCost(%q) = %v, want %v", tt.tier, got, tt.want)
+		}
+	}
+}

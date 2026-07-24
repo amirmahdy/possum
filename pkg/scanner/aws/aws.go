@@ -17,6 +17,8 @@ import (
 	cwtypes "github.com/aws/aws-sdk-go-v2/service/cloudwatch/types"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	elbv2 "github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2"
+	"github.com/aws/aws-sdk-go-v2/service/rds"
 )
 
 // AWSScanner implements the scanner.Scanner interface for AWS resources.
@@ -59,6 +61,8 @@ func (s *AWSScanner) Scan(ctx context.Context, opts scanner.ScanOptions) ([]scan
 
 	ec2Client := ec2.NewFromConfig(cfg)
 	cwClient := cloudwatch.NewFromConfig(cfg)
+	rdsClient := rds.NewFromConfig(cfg)
+	elbv2Client := elbv2.NewFromConfig(cfg)
 
 	fmt.Println("\nScanning AWS: Unattached EBS Volumes...")
 	ebsFindings, err := scanUnattachedEBS(ctx, ec2Client)
@@ -85,10 +89,28 @@ func (s *AWSScanner) Scan(ctx context.Context, opts scanner.ScanOptions) ([]scan
 		fmt.Printf("Found %d idle EC2 instances.\n", len(ec2Findings))
 	}
 
+	fmt.Println("\nScanning AWS: Idle RDS DB Instances...")
+	rdsFindings, err := scanIdleRDS(ctx, rdsClient, cwClient, opts.CPUAvgThreshold, opts.LookbackDays)
+	if err != nil {
+		fmt.Printf("Error scanning RDS DB instances: %v\n", err)
+	} else {
+		fmt.Printf("Found %d idle RDS DB instances.\n", len(rdsFindings))
+	}
+
+	fmt.Println("\nScanning AWS: Unused Load Balancers...")
+	lbFindings, err := scanUnusedLoadBalancers(ctx, elbv2Client, cwClient, opts.LookbackDays)
+	if err != nil {
+		fmt.Printf("Error scanning Load Balancers: %v\n", err)
+	} else {
+		fmt.Printf("Found %d unused Load Balancers.\n", len(lbFindings))
+	}
+
 	var findings []scanner.Finding
 	findings = append(findings, ebsFindings...)
 	findings = append(findings, eipFindings...)
 	findings = append(findings, ec2Findings...)
+	findings = append(findings, rdsFindings...)
+	findings = append(findings, lbFindings...)
 
 	return findings, nil
 }
@@ -348,6 +370,189 @@ func scanIdleEC2(ctx context.Context, ec2Client *ec2.Client, cwClient *cloudwatc
 						EstimatedMonthlySavings: math.Round(cost*100) / 100,
 					})
 				}
+			}
+		}
+	}
+
+	return findings, nil
+}
+
+func getRDSMetricSum(ctx context.Context, client *cloudwatch.Client, dbID string, metricName string, lookbackDays int) (float64, error) {
+	endTime := time.Now()
+	startTime := endTime.AddDate(0, 0, -lookbackDays)
+
+	input := &cloudwatch.GetMetricStatisticsInput{
+		Namespace:  aws.String("AWS/RDS"),
+		MetricName: aws.String(metricName),
+		Dimensions: []cwtypes.Dimension{
+			{
+				Name:  aws.String("DBInstanceIdentifier"),
+				Value: aws.String(dbID),
+			},
+		},
+		StartTime:  aws.Time(startTime),
+		EndTime:    aws.Time(endTime),
+		Period:     aws.Int32(86400),
+		Statistics: []cwtypes.Statistic{cwtypes.StatisticSum, cwtypes.StatisticMaximum},
+	}
+
+	output, err := client.GetMetricStatistics(ctx, input)
+	if err != nil {
+		return 0, err
+	}
+
+	var total float64
+	for _, dp := range output.Datapoints {
+		if dp.Sum != nil {
+			total += *dp.Sum
+		} else if dp.Maximum != nil {
+			total += *dp.Maximum
+		}
+	}
+	return total, nil
+}
+
+func getRDSMetricAverage(ctx context.Context, client *cloudwatch.Client, dbID string, metricName string, lookbackDays int) (float64, error) {
+	endTime := time.Now()
+	startTime := endTime.AddDate(0, 0, -lookbackDays)
+
+	input := &cloudwatch.GetMetricStatisticsInput{
+		Namespace:  aws.String("AWS/RDS"),
+		MetricName: aws.String(metricName),
+		Dimensions: []cwtypes.Dimension{
+			{
+				Name:  aws.String("DBInstanceIdentifier"),
+				Value: aws.String(dbID),
+			},
+		},
+		StartTime:  aws.Time(startTime),
+		EndTime:    aws.Time(endTime),
+		Period:     aws.Int32(3600),
+		Statistics: []cwtypes.Statistic{cwtypes.StatisticAverage},
+	}
+
+	output, err := client.GetMetricStatistics(ctx, input)
+	if err != nil {
+		return 0, err
+	}
+
+	if len(output.Datapoints) == 0 {
+		return 0, nil
+	}
+
+	var sum float64
+	for _, dp := range output.Datapoints {
+		if dp.Average != nil {
+			sum += *dp.Average
+		}
+	}
+	return sum / float64(len(output.Datapoints)), nil
+}
+
+func scanIdleRDS(ctx context.Context, rdsClient *rds.Client, cwClient *cloudwatch.Client, cpuAvgThreshold float64, lookbackDays int) ([]scanner.Finding, error) {
+	var findings []scanner.Finding
+
+	paginator := rds.NewDescribeDBInstancesPaginator(rdsClient, &rds.DescribeDBInstancesInput{})
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return nil, err
+		}
+
+		for _, db := range page.DBInstances {
+			if db.DBInstanceStatus == nil || *db.DBInstanceStatus != "available" {
+				continue
+			}
+
+			dbID := aws.ToString(db.DBInstanceIdentifier)
+			dbClass := aws.ToString(db.DBInstanceClass)
+			engine := aws.ToString(db.Engine)
+
+			var tagMap map[string]string
+			if len(db.TagList) > 0 {
+				tagMap = make(map[string]string)
+				for _, t := range db.TagList {
+					if t.Key != nil && t.Value != nil {
+						tagMap[*t.Key] = *t.Value
+					}
+				}
+			}
+
+			connections, err := getRDSMetricSum(ctx, cwClient, dbID, "DatabaseConnections", lookbackDays)
+			if err != nil {
+				log.Printf("Warning: failed to query CloudWatch DatabaseConnections for RDS %s: %v\n", dbID, err)
+				continue
+			}
+
+			avgCPU, err := getRDSMetricAverage(ctx, cwClient, dbID, "CPUUtilization", lookbackDays)
+			if err != nil {
+				log.Printf("Warning: failed to query CloudWatch CPUUtilization for RDS %s: %v\n", dbID, err)
+				continue
+			}
+
+			if connections == 0 && avgCPU < cpuAvgThreshold {
+				cost := pricing.GetRDSMonthlyCost(dbClass)
+
+				findings = append(findings, scanner.Finding{
+					ID:   dbID,
+					Type: fmt.Sprintf("Idle RDS DB Instance (%s)", dbClass),
+					Details: fmt.Sprintf(
+						"Engine: %s, Class: %s, Connections: %.0f, Avg CPU: %.2f%% over %d days",
+						engine, dbClass, connections, avgCPU, lookbackDays,
+					),
+					Tags:                    tagMap,
+					EstimatedMonthlySavings: math.Round(cost*100) / 100,
+				})
+			}
+		}
+	}
+
+	return findings, nil
+}
+
+func scanUnusedLoadBalancers(ctx context.Context, elbv2Client *elbv2.Client, cwClient *cloudwatch.Client, lookbackDays int) ([]scanner.Finding, error) {
+	var findings []scanner.Finding
+
+	paginator := elbv2.NewDescribeLoadBalancersPaginator(elbv2Client, &elbv2.DescribeLoadBalancersInput{})
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return nil, err
+		}
+
+		for _, lb := range page.LoadBalancers {
+			lbARN := aws.ToString(lb.LoadBalancerArn)
+			lbName := aws.ToString(lb.LoadBalancerName)
+			lbType := string(lb.Type)
+			dnsName := aws.ToString(lb.DNSName)
+			scheme := string(lb.Scheme)
+
+			tgOutput, err := elbv2Client.DescribeTargetGroups(ctx, &elbv2.DescribeTargetGroupsInput{
+				LoadBalancerArn: lb.LoadBalancerArn,
+			})
+
+			totalTargets := 0
+			if err == nil {
+				for _, tg := range tgOutput.TargetGroups {
+					thOutput, err := elbv2Client.DescribeTargetHealth(ctx, &elbv2.DescribeTargetHealthInput{
+						TargetGroupArn: tg.TargetGroupArn,
+					})
+					if err == nil {
+						totalTargets += len(thOutput.TargetHealthDescriptions)
+					}
+				}
+			}
+
+			if totalTargets == 0 {
+				findings = append(findings, scanner.Finding{
+					ID:   lbName,
+					Type: fmt.Sprintf("Unused Load Balancer (%s)", lbType),
+					Details: fmt.Sprintf(
+						"ARN: %s, Type: %s, Scheme: %s, DNS: %s, Registered Targets: 0",
+						lbARN, lbType, scheme, dnsName,
+					),
+					EstimatedMonthlySavings: pricing.LoadBalancerMonthlyCost,
+				})
 			}
 		}
 	}

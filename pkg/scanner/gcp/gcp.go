@@ -14,9 +14,11 @@ import (
 	compute "cloud.google.com/go/compute/apiv1"
 	computepb "cloud.google.com/go/compute/apiv1/computepb"
 	monitoring "cloud.google.com/go/monitoring/apiv3/v2"
+	monitoringpb "cloud.google.com/go/monitoring/apiv3/v2/monitoringpb"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
-	monitoringpb "cloud.google.com/go/monitoring/apiv3/v2/monitoringpb"
+	sqladmin "google.golang.org/api/sqladmin/v1"
+	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -71,10 +73,19 @@ func (s *GCPScanner) Scan(ctx context.Context, opts scanner.ScanOptions) ([]scan
 		fmt.Printf("Found %d idle VM instances.\n", len(vmFindings))
 	}
 
+	fmt.Println("\nScanning GCP: Idle Cloud SQL Instances...")
+	sqlFindings, err := scanIdleCloudSQL(ctx, opts.Project, clientOpts, opts.CPUAvgThreshold, opts.LookbackDays)
+	if err != nil {
+		fmt.Printf("Error scanning Cloud SQL instances: %v\n", err)
+	} else {
+		fmt.Printf("Found %d idle Cloud SQL instances.\n", len(sqlFindings))
+	}
+
 	var findings []scanner.Finding
 	findings = append(findings, diskFindings...)
 	findings = append(findings, ipFindings...)
 	findings = append(findings, vmFindings...)
+	findings = append(findings, sqlFindings...)
 
 	return findings, nil
 }
@@ -329,6 +340,10 @@ func getGCPNetworkBytes(ctx context.Context, metricClient *monitoring.MetricClie
 			StartTime: timestamppb.New(startTime),
 			EndTime:   timestamppb.New(endTime),
 		},
+		Aggregation: &monitoringpb.Aggregation{
+			AlignmentPeriod:  durationpb.New(time.Hour),
+			PerSeriesAligner: monitoringpb.Aggregation_ALIGN_DELTA,
+		},
 		View: monitoringpb.ListTimeSeriesRequest_FULL,
 	}
 
@@ -365,4 +380,134 @@ func getResourceNameFromURL(url string) string {
 	}
 	parts := strings.Split(url, "/")
 	return parts[len(parts)-1]
+}
+
+func scanIdleCloudSQL(ctx context.Context, projectID string, opts []option.ClientOption, cpuAvgThreshold float64, lookbackDays int) ([]scanner.Finding, error) {
+	var findings []scanner.Finding
+
+	sqlService, err := sqladmin.NewService(ctx, opts...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create SQLAdmin client: %w", err)
+	}
+
+	instancesList, err := sqlService.Instances.List(projectID).Context(ctx).Do()
+	if err != nil {
+		return nil, fmt.Errorf("failed to list Cloud SQL instances: %w", err)
+	}
+
+	metricClient, err := monitoring.NewMetricClient(ctx, opts...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create monitoring client: %w", err)
+	}
+	defer metricClient.Close()
+
+	now := time.Now()
+	startTime := now.AddDate(0, 0, -lookbackDays)
+
+	for _, inst := range instancesList.Items {
+		if inst.State != "RUNNABLE" {
+			continue
+		}
+
+		instName := inst.Name
+		tier := ""
+		if inst.Settings != nil {
+			tier = inst.Settings.Tier
+		}
+		dbVersion := inst.DatabaseVersion
+
+		connCount := getCloudSQLMetricSum(ctx, metricClient, projectID, instName, "cloudsql.googleapis.com/database/network/connections", startTime, now)
+		avgCPU := getCloudSQLMetricAverage(ctx, metricClient, projectID, instName, "cloudsql.googleapis.com/database/cpu/utilization", startTime, now)
+
+		if connCount == 0 && avgCPU < cpuAvgThreshold {
+			cost := pricing.GetCloudSQLMonthlyCost(tier)
+
+			var tagMap map[string]string
+			if inst.Settings != nil && len(inst.Settings.UserLabels) > 0 {
+				tagMap = inst.Settings.UserLabels
+			}
+
+			findings = append(findings, scanner.Finding{
+				ID:   instName,
+				Type: fmt.Sprintf("Idle Cloud SQL Instance (%s)", tier),
+				Details: fmt.Sprintf(
+					"Database Version: %s, Tier: %s, Connections: %.0f, Avg CPU: %.2f%% over %d days",
+					dbVersion, tier, connCount, avgCPU, lookbackDays,
+				),
+				Tags:                    tagMap,
+				EstimatedMonthlySavings: math.Round(cost*100) / 100,
+			})
+		}
+	}
+
+	return findings, nil
+}
+
+func getCloudSQLMetricSum(ctx context.Context, metricClient *monitoring.MetricClient, projectID string, instanceName string, metricType string, startTime, endTime time.Time) float64 {
+	metricFilter := fmt.Sprintf(`metric.type="%s" AND resource.type="cloudsql_database" AND resource.label.database_id="%s:%s"`, metricType, projectID, instanceName)
+
+	req := &monitoringpb.ListTimeSeriesRequest{
+		Name:   fmt.Sprintf("projects/%s", projectID),
+		Filter: metricFilter,
+		Interval: &monitoringpb.TimeInterval{
+			StartTime: timestamppb.New(startTime),
+			EndTime:   timestamppb.New(endTime),
+		},
+		View: monitoringpb.ListTimeSeriesRequest_FULL,
+	}
+
+	tsIter := metricClient.ListTimeSeries(ctx, req)
+	var total float64
+	for {
+		ts, err := tsIter.Next()
+		if err == iterator.Done || err != nil {
+			break
+		}
+		for _, point := range ts.GetPoints() {
+			val := point.GetValue()
+			if val.GetInt64Value() != 0 {
+				total += float64(val.GetInt64Value())
+			} else {
+				total += val.GetDoubleValue()
+			}
+		}
+	}
+	return total
+}
+
+func getCloudSQLMetricAverage(ctx context.Context, metricClient *monitoring.MetricClient, projectID string, instanceName string, metricType string, startTime, endTime time.Time) float64 {
+	metricFilter := fmt.Sprintf(`metric.type="%s" AND resource.type="cloudsql_database" AND resource.label.database_id="%s:%s"`, metricType, projectID, instanceName)
+
+	req := &monitoringpb.ListTimeSeriesRequest{
+		Name:   fmt.Sprintf("projects/%s", projectID),
+		Filter: metricFilter,
+		Interval: &monitoringpb.TimeInterval{
+			StartTime: timestamppb.New(startTime),
+			EndTime:   timestamppb.New(endTime),
+		},
+		View: monitoringpb.ListTimeSeriesRequest_FULL,
+	}
+
+	tsIter := metricClient.ListTimeSeries(ctx, req)
+	var sum float64
+	var count int
+	for {
+		ts, err := tsIter.Next()
+		if err == iterator.Done || err != nil {
+			break
+		}
+		for _, point := range ts.GetPoints() {
+			val := point.GetValue()
+			if val.GetDoubleValue() != 0 {
+				sum += val.GetDoubleValue() * 100.0
+			} else {
+				sum += float64(val.GetInt64Value()) * 100.0
+			}
+			count++
+		}
+	}
+	if count == 0 {
+		return 0.0
+	}
+	return sum / float64(count)
 }
